@@ -1,0 +1,16 @@
+{
+  "name": "Signal Bot Real — 技術分析機器人",
+  "short_name": "SignalBot Real",
+  "description": "使用真實行情、技術指標、新聞與市場環境的分析工具",
+  "start_url": "/index.html",
+  "display": "standalone",
+  "background_color": "#0a0c0f",
+  "theme_color": "#00e5a0",
+  "orientation": "portrait-primary",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "categories": ["finance", "utilities"],
+  "lang": "zh-TW"
+}
