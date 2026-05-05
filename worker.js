@@ -15,7 +15,7 @@ export default {
       if (url.pathname === '/api/health') {
         return json({
           ok: true,
-          name: 'SignalBot Beauty Gemini Worker v13',
+          name: 'SignalBot Beauty Gemini Worker v17',
           hasGeminiKey: !!env.GEMINI_API_KEY,
           model: env.GEMINI_MODEL || 'gemini-2.5-flash',
           endpoints: ['POST /api/analyze'],
@@ -52,7 +52,7 @@ async function analyze(input, env) {
   if (!prices.candles?.length || prices.candles.length < 40) throw new Error(`行情資料不足：${rawTicker}`);
 
   const tech = computeTechnicals(prices.candles);
-  const quotePack = await fetchMultiQuotes(rawTicker, assetType, prices, env).catch(() => ({ quotes: [], consensus: null, spreadPct: null, warning: '多重報價暫時不可用' }));
+  const quotePack = await fetchMultiQuotes(rawTicker, assetType, prices, env).catch(() => ({ quotes: [], quoteCandidates: [], closeCandidates: [], consensus: null, spreadPct: null, closePrice: null, priceVsClosePct: null, warning: '多重報價暫時不可用' }));
   if (quotePack?.consensus?.price) {
     tech.livePrice = quotePack.consensus.price;
     prices.liveQuote = quotePack.consensus;
@@ -65,6 +65,11 @@ async function analyze(input, env) {
   const cross = quotePack.quotes || [];
 
   const scorePack = computeScore(tech, market, news, assetType);
+  if (quotePack.warning) scorePack.warnings.unshift(quotePack.warning);
+  if (quotePack.priceVsClosePct != null && Math.abs(quotePack.priceVsClosePct) > 1) {
+    scorePack.warnings.unshift(`現價與K線收盤差異 ${quotePack.priceVsClosePct.toFixed(2)}%，可能是盤中/延遲報價與歷史K線時間差。`);
+  }
+  scorePack.warnings = scorePack.warnings.slice(0, 6);
   let ai = null;
   if (input.useAI !== false && env.GEMINI_API_KEY) {
     ai = await callGemini({ rawTicker, assetType, prices, tech, market, news, scorePack, cross }, env)
@@ -124,19 +129,41 @@ function quotePackFrom(quotes, fallbackClose) {
   const clean = quotes
     .filter(q => q && Number.isFinite(Number(q.price)) && Number(q.price) > 0)
     .map(q => ({ ...q, price: Number(q.price) }));
-  if (Number.isFinite(Number(fallbackClose)) && Number(fallbackClose) > 0) {
+
+  const hasCloseLike = clean.some(q => ['close', 'chart-close', 'daily-close'].includes(q.type));
+  if (!hasCloseLike && Number.isFinite(Number(fallbackClose)) && Number(fallbackClose) > 0) {
     clean.push({ source: 'K線最後收盤', price: Number(fallbackClose), type: 'close', time: new Date().toISOString() });
   }
-  const prices = clean.map(q => q.price);
-  const med = median(prices);
-  const min = prices.length ? Math.min(...prices) : null;
-  const max = prices.length ? Math.max(...prices) : null;
+
+  // 重點：現價不要被 K 線收盤價拉歪。
+  // 先用 live / delayed / prev-close 這類 quote 來源取中位數；沒有 quote 才退回 K 線或日收盤。
+  const quoteCandidates = clean.filter(q => ['live', 'delayed', 'prev-close'].includes(q.type));
+  const closeCandidates = clean.filter(q => ['close', 'chart-close', 'daily-close'].includes(q.type));
+  const basis = quoteCandidates.length ? quoteCandidates : closeCandidates;
+  const med = median(basis.map(q => q.price));
+
+  const allPrices = clean.map(q => q.price);
+  const min = allPrices.length ? Math.min(...allPrices) : null;
+  const max = allPrices.length ? Math.max(...allPrices) : null;
   const spreadPct = med ? ((max - min) / med) * 100 : null;
-  const consensus = med ? { source: clean.length >= 2 ? '多重報價中位數' : (clean[0]?.source || '單一報價'), price: med, time: new Date().toISOString() } : null;
+  const closePrice = Number.isFinite(Number(fallbackClose)) ? Number(fallbackClose) : null;
+  const priceVsClosePct = med && closePrice ? ((med - closePrice) / closePrice) * 100 : null;
+
+  const consensus = med ? {
+    source: quoteCandidates.length >= 2 ? '多重即時報價中位數' : quoteCandidates.length === 1 ? quoteCandidates[0].source : (basis[0]?.source || 'K線收盤'),
+    price: med,
+    basis: quoteCandidates.length ? 'quote' : 'close',
+    time: new Date().toISOString()
+  } : null;
+
   return {
     quotes: clean,
+    quoteCandidates,
+    closeCandidates,
     consensus,
     spreadPct,
+    closePrice,
+    priceVsClosePct,
     warning: spreadPct != null && spreadPct > 2 ? `報價來源差異 ${spreadPct.toFixed(2)}%，請再確認交易所或盤中資料。` : null
   };
 }
@@ -226,8 +253,7 @@ async function fetchStooqQuote(symbol) {
   const res = await fetch(url, { headers: { accept: 'text/csv', 'user-agent': 'SignalBot/3.3' } }).catch(() => null);
   if (!res || !res.ok) return null;
   const text = await res.text();
-  const lines = text.trim().split(/?
-/);
+  const lines = text.trim().split(/\r?\n/);
   if (lines.length < 2) return null;
   const headers = lines[0].split(',').map(x => x.trim().toLowerCase());
   const vals = lines[1].split(',').map(x => x.trim());
