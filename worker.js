@@ -15,11 +15,11 @@ export default {
       if (url.pathname === '/api/health') {
         return json({
           ok: true,
-          name: 'SignalBot Beauty Gemini Worker',
+          name: 'SignalBot Beauty Gemini Worker v13',
           hasGeminiKey: !!env.GEMINI_API_KEY,
           model: env.GEMINI_MODEL || 'gemini-2.5-flash',
           endpoints: ['POST /api/analyze'],
-          marketSources: { crypto: ['binance', 'okx'], stock: ['yahoo', 'finmind_tw'] },
+          marketSources: { crypto: ['binance', 'okx', 'coinbase'], stock: ['yahoo_quote', 'yahoo_chart', 'finmind_tw', 'twse', 'tpex', 'stooq'] },
           newsSources: ['Google News RSS', 'Yahoo Finance Search', 'GDELT fallback']
         });
       }
@@ -52,17 +52,17 @@ async function analyze(input, env) {
   if (!prices.candles?.length || prices.candles.length < 40) throw new Error(`行情資料不足：${rawTicker}`);
 
   const tech = computeTechnicals(prices.candles);
-  const latestQuote = await fetchLiveQuoteSafe(prices.normalizedTicker, assetType, prices.sourceKey);
-  if (latestQuote?.price) {
-    tech.livePrice = latestQuote.price;
-    prices.liveQuote = latestQuote;
+  const quotePack = await fetchMultiQuotes(rawTicker, assetType, prices, env).catch(() => ({ quotes: [], consensus: null, spreadPct: null, warning: '多重報價暫時不可用' }));
+  if (quotePack?.consensus?.price) {
+    tech.livePrice = quotePack.consensus.price;
+    prices.liveQuote = quotePack.consensus;
   }
 
-  const [market, news, cross] = await Promise.all([
+  const [market, news] = await Promise.all([
     fetchMarketContext(assetType).catch(err => ({ items: [], scoreAdj: 0, summary: `市場環境暫時不可用：${err.message}` })),
-    fetchNews(rawTicker, assetType).catch(err => ({ articles: [], sourceMix: [], summary: `新聞暫時不可用：${err.message}` })),
-    fetchCrossChecks(rawTicker, assetType).catch(() => [])
+    fetchNews(rawTicker, assetType).catch(err => ({ articles: [], sourceMix: [], summary: `新聞暫時不可用：${err.message}` }))
   ]);
+  const cross = quotePack.quotes || [];
 
   const scorePack = computeScore(tech, market, news, assetType);
   let ai = null;
@@ -91,6 +91,7 @@ async function analyze(input, env) {
     price: tech.livePrice || tech.close,
     closePrice: tech.close,
     liveQuote: prices.liveQuote || null,
+    priceCheck: quotePack,
     crossChecks: cross,
     change1dPct: tech.change1dPct,
     candles: prices.candles.slice(-240),
@@ -109,7 +110,130 @@ function normalizeInterval(v, assetType) {
 
 function sourceNotes(assetType) {
   if (assetType === 'crypto') return '加密貨幣支援 Binance 與 OKX，auto 會優先 Binance，失敗改 OKX；同時做跨交易所報價檢查。';
-  return '股票支援 Yahoo Finance 與 FinMind 台股日線。國泰 / 富邦若要接券商專屬 API，建議另外做本機端安全版，不要把帳密放公開網站。';
+  return '股票多重報價支援 Yahoo Quote / Yahoo Chart、FinMind、TWSE 上市、TPEx 上櫃與 Stooq 備援。國泰 / 富邦若要接券商專屬 API，建議另外做本機端安全版，不要把帳密放公開網站。';
+}
+
+function median(nums) {
+  const a = nums.filter(Number.isFinite).sort((x, y) => x - y);
+  if (!a.length) return null;
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+function quotePackFrom(quotes, fallbackClose) {
+  const clean = quotes
+    .filter(q => q && Number.isFinite(Number(q.price)) && Number(q.price) > 0)
+    .map(q => ({ ...q, price: Number(q.price) }));
+  if (Number.isFinite(Number(fallbackClose)) && Number(fallbackClose) > 0) {
+    clean.push({ source: 'K線最後收盤', price: Number(fallbackClose), type: 'close', time: new Date().toISOString() });
+  }
+  const prices = clean.map(q => q.price);
+  const med = median(prices);
+  const min = prices.length ? Math.min(...prices) : null;
+  const max = prices.length ? Math.max(...prices) : null;
+  const spreadPct = med ? ((max - min) / med) * 100 : null;
+  const consensus = med ? { source: clean.length >= 2 ? '多重報價中位數' : (clean[0]?.source || '單一報價'), price: med, time: new Date().toISOString() } : null;
+  return {
+    quotes: clean,
+    consensus,
+    spreadPct,
+    warning: spreadPct != null && spreadPct > 2 ? `報價來源差異 ${spreadPct.toFixed(2)}%，請再確認交易所或盤中資料。` : null
+  };
+}
+
+async function fetchMultiQuotes(rawTicker, assetType, prices, env = {}) {
+  const fallbackClose = prices.candles?.[prices.candles.length - 1]?.close;
+  if (assetType === 'crypto') {
+    const base = normalizeCryptoSymbol(rawTicker);
+    const jobs = [
+      fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${base}USDT`).then(r => r.ok ? r.json() : null).then(d => d?.price ? { source: 'Binance', symbol: `${base}USDT`, price: Number(d.price), type: 'live' } : null).catch(() => null),
+      fetch(`https://www.okx.com/api/v5/market/ticker?instId=${base}-USDT`).then(r => r.ok ? r.json() : null).then(d => d?.data?.[0]?.last ? { source: 'OKX', symbol: `${base}-USDT`, price: Number(d.data[0].last), type: 'live' } : null).catch(() => null),
+      fetch(`https://api.coinbase.com/v2/prices/${base}-USD/spot`).then(r => r.ok ? r.json() : null).then(d => d?.data?.amount ? { source: 'Coinbase', symbol: `${base}-USD`, price: Number(d.data.amount), type: 'live' } : null).catch(() => null)
+    ];
+    return quotePackFrom(await Promise.all(jobs), fallbackClose);
+  }
+
+  const symbol = normalizeStockTicker(rawTicker);
+  const stockId = normalizeTaiwanStockId(rawTicker);
+  const jobs = [
+    fetchYahooQuote(symbol),
+    { source: 'Yahoo Chart', symbol, price: Number(fallbackClose), type: 'chart-close', time: new Date().toISOString() }
+  ];
+
+  if (stockId) {
+    jobs.push(fetchTwMarketQuote(stockId, 'tse'));
+    jobs.push(fetchTwMarketQuote(stockId, 'otc'));
+    jobs.push(fetchFinMindLatestQuote(stockId, env));
+  } else {
+    jobs.push(fetchStooqQuote(symbol));
+  }
+
+  return quotePackFrom(await Promise.all(jobs), fallbackClose);
+}
+
+async function fetchYahooQuote(symbol) {
+  return fetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`, { headers: { accept: 'application/json', 'user-agent': 'SignalBot/3.3' } })
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      const q = d?.quoteResponse?.result?.[0];
+      const price = q?.regularMarketPrice || q?.postMarketPrice || q?.preMarketPrice || q?.regularMarketPreviousClose;
+      return Number.isFinite(Number(price)) ? { source: 'Yahoo Quote', symbol, price: Number(price), type: 'live' } : null;
+    }).catch(() => null);
+}
+
+function normalizeTaiwanStockId(raw) {
+  const s = String(raw || '').toUpperCase().trim().replace('.TW', '');
+  return /^[0-9]{4,6}[A-Z]?$/.test(s) ? s : null;
+}
+
+async function fetchTwMarketQuote(stockId, market) {
+  const ex = market === 'otc' ? 'otc' : 'tse';
+  const source = market === 'otc' ? 'TPEx 上櫃' : 'TWSE 上市';
+  const exCh = `${ex}_${stockId}.tw`;
+  const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(exCh)}&json=1&delay=0&_=${Date.now()}`;
+  const res = await fetch(url, {
+    headers: {
+      accept: 'application/json,text/plain,*/*',
+      referer: 'https://mis.twse.com.tw/stock/index.jsp',
+      'user-agent': 'SignalBot/3.3'
+    }
+  }).catch(() => null);
+  if (!res || !res.ok) return null;
+  const d = await res.json().catch(() => null);
+  const q = d?.msgArray?.[0];
+  if (!q) return null;
+  const rawPrice = q.z && q.z !== '-' ? q.z : (q.y && q.y !== '-' ? q.y : null);
+  const price = Number(String(rawPrice || '').replace(/,/g, ''));
+  return Number.isFinite(price) && price > 0 ? { source, symbol: `${stockId}.TW`, price, type: q.z && q.z !== '-' ? 'live' : 'prev-close' } : null;
+}
+
+async function fetchFinMindLatestQuote(stockId, env = {}) {
+  let url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${encodeURIComponent(stockId)}&start_date=${dateDaysAgo(12)}`;
+  if (env.FINMIND_TOKEN) url += `&token=${encodeURIComponent(env.FINMIND_TOKEN)}`;
+  const res = await fetch(url, { headers: { accept: 'application/json' } }).catch(() => null);
+  if (!res || !res.ok) return null;
+  const d = await res.json().catch(() => null);
+  const rows = Array.isArray(d?.data) ? d.data : [];
+  const lastRow = rows.reverse().find(x => Number.isFinite(Number(x.close)) && Number(x.close) > 0);
+  return lastRow ? { source: 'FinMind 台股', symbol: `${stockId}.TW`, price: Number(lastRow.close), type: 'daily-close', time: lastRow.date } : null;
+}
+
+async function fetchStooqQuote(symbol) {
+  let s = String(symbol || '').toLowerCase().trim();
+  if (!s.includes('.')) s = `${s}.us`;
+  if (s.endsWith('.tw')) return null;
+  const url = `https://stooq.com/q/l/?s=${encodeURIComponent(s)}&f=sd2t2ohlcv&h&e=csv`;
+  const res = await fetch(url, { headers: { accept: 'text/csv', 'user-agent': 'SignalBot/3.3' } }).catch(() => null);
+  if (!res || !res.ok) return null;
+  const text = await res.text();
+  const lines = text.trim().split(/?
+/);
+  if (lines.length < 2) return null;
+  const headers = lines[0].split(',').map(x => x.trim().toLowerCase());
+  const vals = lines[1].split(',').map(x => x.trim());
+  const idxClose = headers.indexOf('close');
+  const price = Number(vals[idxClose]);
+  return Number.isFinite(price) && price > 0 ? { source: 'Stooq', symbol: s, price, type: 'delayed' } : null;
 }
 
 async function fetchPriceSeries(rawTicker, assetType, interval, range, sourcePref, env) {
@@ -468,7 +592,7 @@ function recommendationByScore(score) {
 async function callGemini(pack, env) {
   const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-  const prompt = `你是繁體中文投資研究助理。根據真實行情、技術指標、新聞標題、來源與市場環境，做出簡潔但實用的整理。\n\n請務必輸出：\n1. 一句結論（可以自然帶入 ${pack.scorePack.recommendation}）\n2. 技術面重點\n3. 新聞/人物/事件面重點\n4. 風險提醒\n5. 參考操作計畫（只能談分批、等待、停損，不可保證獲利或鼓勵梭哈）\n\n資料：${JSON.stringify({ ticker: pack.rawTicker, assetType: pack.assetType, source: pack.prices.source, price: pack.tech.livePrice || pack.tech.close, crossChecks: pack.cross, technicals: pack.tech, market: pack.market, news: pack.news.articles.slice(0, 8), scorePack: pack.scorePack }, null, 2)}`;
+  const prompt = `你是繁體中文投資研究助理。根據真實行情、技術指標、新聞標題、來源與市場環境，做出簡潔但實用的整理。\n\n請務必輸出：\n1. 一句結論（可以自然帶入 ${pack.scorePack.recommendation}）\n2. 技術面重點\n3. 新聞/人物/事件面重點\n4. 風險提醒\n5. 參考操作計畫（只能談分批、等待、停損，不可保證獲利或鼓勵梭哈）\n\n資料：${JSON.stringify({ ticker: pack.rawTicker, assetType: pack.assetType, source: pack.prices.source, price: pack.tech.livePrice || pack.tech.close, crossChecks: pack.cross, priceCheck: pack.prices.liveQuote, technicals: pack.tech, market: pack.market, news: pack.news.articles.slice(0, 8), scorePack: pack.scorePack }, null, 2)}`;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
